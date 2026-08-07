@@ -1122,24 +1122,9 @@ st.title(
 )
 
 
-st.write(
-"""
-Dieses Tool prüft eine ARS-Region gegen:
-
-- Verwaltungsportal Bund
-- PVOG
-- FIT-Connect Routing
-- XZuFi 2.3
-- Online-Dienste
-
-und erzeugt eine Excel-Auswertung.
-"""
-)
-
-
 
 ars = st.text_input(
-    "12-stellige ARS Nummer",
+    "12-stelligen ARS eingeben: ",
     max_chars=12
 )
 
