@@ -15,7 +15,7 @@ from openpyxl.styles import Font, Alignment
 # ============================================================
 
 st.set_page_config(
-    page_title="PVOG Annex Perso Prüftool",
+    page_title="PVOG-Analysetool für AnnexPerso mit Excelausgabe",
     page_icon="🏛️",
     layout="wide"
 )
@@ -1118,7 +1118,7 @@ def create_excel(
 
 
 st.title(
-    "🏛️ PVOG Annex Perso Prüftool"
+    "🏛️ PVOG-Analysetool für AnnexPerso mit Excelausgabe"
 )
 
 
