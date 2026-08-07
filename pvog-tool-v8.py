@@ -299,10 +299,7 @@ def get_oe_od_ids(
 # ============================================================
 
 
-def check_oe_id(
-        oe_id,
-        logger=None
-):
+def check_oe_id(oe_id, logger=None):
 
     if not oe_id:
         return ""
@@ -317,7 +314,6 @@ def check_oe_id(
 
     resp = fetch_url(url)
 
-
     title = ""
 
 
@@ -327,43 +323,50 @@ def check_oe_id(
 
             data = resp.json()
 
-            extracted = []
+            extracted_texts = []
 
 
             banned_words = [
-
+                "telefon festnetz",
                 "telefon",
                 "e-mail",
                 "fax",
+                "telefax",
                 "mobil",
+                "mobiltelefon",
                 "postanschrift",
                 "besuchsadresse",
                 "webseite",
                 "internet",
                 "hausanschrift"
+            ]
+
+
+            ignored_keys = [
+
+                "additionalInformation",
+                "communicationSystems",
+                "contactDetails",
+                "contact",
+                "contacts",
+                "communications",
+                "addresses",
+                "channels",
+                "communicationChannels",
+                "openingHours",
+                "paymentMethods"
 
             ]
 
 
             def extract_names(obj):
 
-                if isinstance(
-                    obj,
-                    dict
-                ):
+                if isinstance(obj, dict):
 
                     for key, value in obj.items():
 
-                        if key in [
-                            "additionalInformation",
-                            "communicationSystems",
-                            "contactDetails",
-                            "contacts",
-                            "addresses",
-                            "channels",
-                            "openingHours"
-                        ]:
 
+                        if key in ignored_keys:
                             continue
 
 
@@ -372,19 +375,18 @@ def check_oe_id(
                             "name"
                         ]:
 
-                            if isinstance(
-                                value,
-                                str
-                            ):
+                            if isinstance(value, str):
 
                                 val = value.strip()
 
+
                                 if (
-                                    val.lower()
+                                    val
+                                    and val.lower()
                                     not in banned_words
                                 ):
 
-                                    extracted.append(
+                                    extracted_texts.append(
                                         val
                                     )
 
@@ -395,10 +397,7 @@ def check_oe_id(
                             )
 
 
-                elif isinstance(
-                    obj,
-                    list
-                ):
+                elif isinstance(obj, list):
 
                     for item in obj:
 
@@ -412,33 +411,39 @@ def check_oe_id(
             )
 
 
-            clean = []
+            clean_texts = []
 
-            for item in extracted:
 
-                if item not in clean:
+            for text in extracted_texts:
 
-                    clean.append(
-                        item
+                if text not in clean_texts:
+
+                    clean_texts.append(
+                        text
                     )
 
 
-            if len(clean) >= 2:
+            # gleiche Entscheidung wie Originalskript
+            if len(clean_texts) >= 2:
 
-                title = clean[1]
-
-            elif len(clean) == 1:
-
-                title = clean[0]
+                title = clean_texts[1]
 
 
-        except Exception:
+            elif len(clean_texts) == 1:
 
-            pass
+                title = clean_texts[0]
+
+
+        except Exception as e:
+
+            if logger:
+
+                logger.write(
+                    f"OE Parsing Fehler {oe_id}: {e}"
+                )
 
 
     return title
-
 
 
 # ============================================================
