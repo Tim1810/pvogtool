@@ -1,1189 +1,1262 @@
-import streamlit as st
 import json
-import re
-import ssl
-import urllib.request
-import urllib.error
+from io import BytesIO
+from typing import Any
+
+import requests
+import streamlit as st
 import openpyxl
 
-from io import BytesIO
 from openpyxl.styles import Font, Alignment
+from openpyxl.utils import get_column_letter
 
 
 # ============================================================
-# STREAMLIT CONFIG
+# KONFIGURATION
 # ============================================================
 
-st.set_page_config(
-    page_title="PVOG-Analysetool für AnnexPerso mit Excelausgabe",
-    page_icon="🏛️",
-    layout="wide"
+PVOG_BASE = "https://pvog.fitko.net/suchdienst/api"
+
+LEIKA_IDS = [
+    "99008001014000",
+    "99008001014001",
+    "99008001014002",
+    "99008002010000",
+    "99008002010001",
+    "99008002010003",
+    "99008002010002",
+]
+
+# Aktueller produktiver PVOG-Endpunkt
+SERVICE_DETAIL_URL = (
+    PVOG_BASE +
+    "/v6/servicedescriptions/{lbid}/detail"
+)
+
+# Aktuelle Beta-API:
+# Onlinedienste innerhalb eines ARS, optional nach LeiKa
+ONLINE_SERVICES_URL = (
+    PVOG_BASE +
+    "/v1beta2/onlineservices"
+)
+
+# Zuständige OE eines konkreten Onlinedienstes
+OD_ORGANISATIONS_URL = (
+    PVOG_BASE +
+    "/v1beta2/onlineservices/{od_id}/organisations"
+)
+
+# OE-Detail
+OE_DETAIL_URL = (
+    PVOG_BASE +
+    "/v5/organisationunits/detail"
+)
+
+# OD-Detail
+OD_DETAIL_URL = (
+    PVOG_BASE +
+    "/v2/onlineservices/detail"
 )
 
 
 # ============================================================
-# LEIKA KONFIGURATION
+# STREAMLIT
 # ============================================================
 
-LEIKAS_VERLUST = [
-    "99008001014000",
-    "99008001014001",
-    "99008001014002"
-]
+st.set_page_config(
+    page_title="PVOG LeiKa-Auswertung",
+    page_icon="🏛️",
+    layout="wide",
+)
 
+st.title("🏛️ PVOG LeiKa-Auswertung")
 
-LEIKAS_BEFREIUNG = [
-    "99008002010000",
-    "99008002010001",
-    "99008002010003",
-    "99008002010002"
-]
+st.write(
+    "Für eine ARS werden die gewünschten PVOG-Daten "
+    "für sieben fest definierte LeiKa-IDs ermittelt "
+    "und als Excel-Datei ausgegeben."
+)
 
 
 # ============================================================
-# HTTP HELPER
+# HTTP
 # ============================================================
 
-class DummyResponse:
+SESSION = requests.Session()
 
-    def __init__(self, status_code, text):
-        self.status_code = status_code
-        self.text = text
-
-
-    def json(self):
-        return json.loads(self.text)
+SESSION.headers.update({
+    "User-Agent": "PVOG-Leika-Streamlit/1.0",
+    "Accept": "application/json",
+})
 
 
-
-def fetch_url(url, timeout=15):
-
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent":
-            "Mozilla/5.0 Streamlit PVOG Tool"
-        }
-    )
-
-
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-
-
+def get_json(
+    url: str,
+    params: dict | None = None,
+    timeout: int = 30,
+):
     try:
-
-        with urllib.request.urlopen(
-            req,
+        response = SESSION.get(
+            url,
+            params=params,
             timeout=timeout,
-            context=ctx
-        ) as response:
-
-            text = response.read().decode(
-                "utf-8"
-            )
-
-            return DummyResponse(
-                response.status,
-                text
-            )
-
-
-    except urllib.error.HTTPError as e:
-
-        try:
-            text = e.read().decode(
-                "utf-8"
-            )
-
-        except:
-            text = ""
-
-
-        return DummyResponse(
-            e.code,
-            text
         )
 
+        if response.status_code != 200:
+            return None
+
+        return response.json()
 
     except Exception:
-
         return None
 
 
-
 # ============================================================
-# STREAMLIT STATUS LOGGER
-# ============================================================
-
-class StreamlitLogger:
-
-    def __init__(self):
-
-        self.placeholder = st.empty()
-        self.messages = []
-
-
-    def write(self, text):
-
-        self.messages.append(text)
-
-        self.placeholder.code(
-            "\n".join(self.messages)
-        )
-
-
-
-# ============================================================
-# DIENST URL CHECK
+# ALLGEMEINE JSON-HILFSFUNKTIONEN
 # ============================================================
 
+def text(value: Any) -> str:
 
-def check_dienst_url(
-        ars,
-        service_type,
-        logger=None
-):
+    if value is None:
+        return ""
 
-    if service_type == "Verlustmeldung":
+    if isinstance(value, str):
+        return value.strip()
 
-        url = (
-            "https://verwaltung.bund.de/"
-            "onlinebeantragung/de/onlinedienst/"
-            "1b723afb-c5f8-4ccd-82c5-d5f81afeda01/"
-            f"leistungsschluessel/99008001014002/"
-            f"region/{ars}"
-        )
+    if isinstance(value, (int, float, bool)):
+        return str(value)
 
-        success_text = (
-            "Verlustmeldung Personalausweis"
-        )
+    return ""
 
 
-    else:
+def unique(values):
 
-        url = (
-            "https://verwaltung.bund.de/"
-            "onlinebeantragung/de/onlinedienst/"
-            "bc032656-41c7-4357-980c-0d8e292feeb2/"
-            f"leistungsschluessel/99008002010000/"
-            f"region/{ars}"
-        )
+    result = []
 
-        success_text = (
-            "Befreiung von der Ausweispflicht"
-        )
+    for value in values:
 
+        value = text(value)
 
-    if logger:
-        logger.write(
-            f"Prüfe Dienst URL: {service_type}"
-        )
+        if value and value not in result:
+            result.append(value)
+
+    return result
 
 
-    resp = fetch_url(url)
+def walk_json(obj):
+
+    if isinstance(obj, dict):
+
+        yield obj
+
+        for value in obj.values():
+            yield from walk_json(value)
+
+    elif isinstance(obj, list):
+
+        for item in obj:
+            yield from walk_json(item)
 
 
-    if resp:
-
-        if success_text in resp.text:
-
-            return "verfügbar"
-
-
-        if (
-            "Entschuldigung" in resp.text
-            or "409" in str(resp.status_code)
-        ):
-
-            return "nicht verfügbar"
-
-
-    return "nicht verfügbar"
 # ============================================================
-# PVOG OE / OD IDENTIFIKATION
+# ID-ERKENNUNG
 # ============================================================
 
+def is_oe_id(value):
 
-def get_oe_od_ids(
-        ars,
-        leika,
-        logger=None
-):
-
-    url = (
-        "https://pvog.fitko.net/"
-        "suchdienst/api/v3/servicedescriptions/"
-        f"leikaid?leikaIds={leika}&ars={ars}"
+    return (
+        isinstance(value, str)
+        and ".OE." in value
     )
 
 
-    if logger:
-        logger.write(
-            f"PVOG Serviceabfrage: {leika}"
-        )
+def is_od_id(value):
+
+    return (
+        isinstance(value, str)
+        and ".OD." in value
+    )
 
 
-    resp = fetch_url(url)
+def find_oe_ids(obj):
+
+    result = []
+
+    for item in walk_json(obj):
+
+        for key, value in item.items():
+
+            if isinstance(value, str):
+
+                if is_oe_id(value):
+                    result.append(value)
+
+    return unique(result)
 
 
-    oe_ids = []
-    od_ids = []
-    lbid = ""
+def find_od_ids(obj):
+
+    result = []
+
+    for item in walk_json(obj):
+
+        for key, value in item.items():
+
+            if isinstance(value, str):
+
+                if is_od_id(value):
+                    result.append(value)
+
+    return unique(result)
 
 
-    if resp and resp.status_code == 200:
+# ============================================================
+# 1. ONLINEDIENSTE FÜR ARS + LEIKA
+# ============================================================
 
-        try:
+def get_online_services(
+    ars,
+    leika,
+):
 
-            data = resp.json()
+    return get_json(
+        ONLINE_SERVICES_URL,
+        params={
+            "ars": ars,
+            "leikaIds": leika,
+        },
+    )
 
+
+# ============================================================
+# LBID AUS PVOG-ANTWORT ERMITTELN
+# ============================================================
+
+def find_lbid(
+    data,
+    leika,
+):
+
+    candidates = []
+
+    for item in walk_json(data):
+
+        # mögliche LBID-Felder
+        for key, value in item.items():
+
+            key_lower = key.lower()
 
             if (
-                "content" in data
-                and data["content"]
+                "lbid" in key_lower
+                and isinstance(value, str)
+                and value.strip()
             ):
 
-                item = data["content"][0]
-
-                lbid = item.get(
-                    "id",
-                    ""
+                candidates.append(
+                    value.strip()
                 )
 
+        # ID eines Leistungsobjekts
+        #
+        # Nur aufnehmen, wenn dasselbe Objekt
+        # auch die gesuchte LeiKa enthält.
 
-                text = json.dumps(
-                    item
-                )
-
-
-                oe_ids = list(
-                    dict.fromkeys(
-                        re.findall(
-                            r"([A-Za-z0-9]+\.OE\.[0-9]+)",
-                            text
-                        )
-                    )
-                )
-
-
-                od_ids = list(
-                    dict.fromkeys(
-                        re.findall(
-                            r"([A-Za-z0-9]+\.OD\.[0-9]+)",
-                            text
-                        )
-                    )
-                )
-
-
-        except Exception as e:
-
-            if logger:
-                logger.write(
-                    f"Fehler PVOG Parsing: {e}"
-                )
-
-
-    return (
-        oe_ids,
-        od_ids,
-        lbid
-    )
-
-
-
-# ============================================================
-# OE DETAILDATEN
-# ============================================================
-
-
-def check_oe_id(oe_id, logger=None):
-
-    if not oe_id:
-        return ""
-
-
-    url = (
-        "https://pvog.fitko.net/"
-        "suchdienst/api/v5/"
-        f"organisationunits/detail?q={oe_id}"
-    )
-
-
-    resp = fetch_url(url)
-
-    title = ""
-
-
-    if resp and resp.status_code == 200:
-
-        try:
-
-            data = resp.json()
-
-            extracted_texts = []
-
-
-            banned_words = [
-                "telefon festnetz",
-                "telefon",
-                "e-mail",
-                "fax",
-                "telefax",
-                "mobil",
-                "mobiltelefon",
-                "postanschrift",
-                "besuchsadresse",
-                "webseite",
-                "internet",
-                "hausanschrift"
-            ]
-
-
-            ignored_keys = [
-
-                "additionalInformation",
-                "communicationSystems",
-                "contactDetails",
-                "contact",
-                "contacts",
-                "communications",
-                "addresses",
-                "channels",
-                "communicationChannels",
-                "openingHours",
-                "paymentMethods"
-
-            ]
-
-
-            def extract_names(obj):
-
-                if isinstance(obj, dict):
-
-                    for key, value in obj.items():
-
-
-                        if key in ignored_keys:
-                            continue
-
-
-                        if key in [
-                            "title",
-                            "name"
-                        ]:
-
-                            if isinstance(value, str):
-
-                                val = value.strip()
-
-
-                                if (
-                                    val
-                                    and val.lower()
-                                    not in banned_words
-                                ):
-
-                                    extracted_texts.append(
-                                        val
-                                    )
-
-                        else:
-
-                            extract_names(
-                                value
-                            )
-
-
-                elif isinstance(obj, list):
-
-                    for item in obj:
-
-                        extract_names(
-                            item
-                        )
-
-
-            extract_names(
-                data
+        contains_leika = (
+            leika in json.dumps(
+                item,
+                ensure_ascii=False
             )
-
-
-            clean_texts = []
-
-
-            for text in extracted_texts:
-
-                if text not in clean_texts:
-
-                    clean_texts.append(
-                        text
-                    )
-
-
-            # gleiche Entscheidung wie Originalskript
-            if len(clean_texts) >= 2:
-
-                title = clean_texts[1]
-
-
-            elif len(clean_texts) == 1:
-
-                title = clean_texts[0]
-
-
-        except Exception as e:
-
-            if logger:
-
-                logger.write(
-                    f"OE Parsing Fehler {oe_id}: {e}"
-                )
-
-
-    return title
-
-
-# ============================================================
-# FIT CONNECT ROUTING
-# ============================================================
-
-
-def check_signatur(
-        ars,
-        leika,
-        logger=None
-):
-
-    if not ars or not leika:
-
-        return (
-            "nicht vorhanden",
-            ""
         )
 
+        if contains_leika:
 
-    url = (
-        "https://routing-api-prod."
-        "fit-connect.fitko.net/v2/routes?"
-        f"leikaKey={leika}&ars={ars}"
-    )
+            value = item.get("id")
 
+            if (
+                isinstance(value, str)
+                and value.strip()
+                and not is_od_id(value)
+                and not is_oe_id(value)
+            ):
 
-    resp = fetch_url(url)
-
-
-    if resp:
-
-        try:
-
-            raw = resp.text
-
-
-            if "validation-exception" in raw:
-
-                return (
-                    "validation issue",
-                    ""
+                candidates.append(
+                    value.strip()
                 )
 
+    candidates = unique(candidates)
 
-            data = resp.json()
-
-
-            count = data.get(
-                "count",
-                0
-            )
-
-
-            routes = data.get(
-                "routes",
-                []
-            )
-
-
-            destination = ""
-
-
-            if routes:
-
-                destination = routes[0].get(
-                    "destinationName",
-                    ""
-                )
-
-
-            if count >= 1:
-
-                return (
-                    "vorhanden",
-                    destination
-                )
-
-
-        except Exception:
-
-            pass
-
-
-    return (
-        "nicht vorhanden",
-        ""
-    )
-
+    return candidates[0] if candidates else ""
 
 
 # ============================================================
-# XZUFI 2.3 SIGNATUR
+# 2. LEISTUNGSDETAIL
 # ============================================================
 
-
-def check_signatur_oe(
-        ars,
-        leika,
-        lbid=""
+def get_service_detail(
+    lbid,
+    ars,
 ):
 
-    if leika not in [
-        "99008001014002",
-        "99008002010000"
-    ]:
+    if not lbid:
+        return None
 
+    url = SERVICE_DETAIL_URL.format(
+        lbid=lbid
+    )
+
+    return get_json(
+        url,
+        params={
+            "ars": ars
+        },
+    )
+
+
+# ============================================================
+# 3. OE-DETAIL
+# ============================================================
+
+def get_oe_detail(
+    oe_id,
+    lbid,
+    ars,
+):
+
+    return get_json(
+        OE_DETAIL_URL,
+        params={
+            "q": oe_id,
+            "lbId": lbid,
+            "ars": ars,
+        },
+    )
+
+
+# ============================================================
+# OE-TITEL
+# ============================================================
+
+def extract_oe_title(
+    data
+):
+
+    """
+    Nur echte Titel-/Namensfelder eines
+    OE-Objektes werden berücksichtigt.
+
+    Es wird NICHT mehr:
+        clean_texts[1]
+    verwendet.
+    """
+
+    if not isinstance(data, dict):
         return ""
 
+    preferred = [
+        "title",
+        "name",
+        "organisationUnitTitle",
+        "organisationUnitName",
+        "bezeichnung",
+    ]
 
-    target = (
-        lbid
-        if lbid
-        else leika
+    for key in preferred:
+
+        value = data.get(key)
+
+        if isinstance(value, str):
+
+            value = value.strip()
+
+            if value:
+                return value
+
+    # mögliche verschachtelte OE
+    for key in [
+        "organisationUnit",
+        "organisationseinheit",
+        "organisation",
+    ]:
+
+        child = data.get(key)
+
+        if isinstance(child, dict):
+
+            result = extract_oe_title(
+                child
+            )
+
+            if result:
+                return result
+
+    return ""
+
+
+# ============================================================
+# OE-SIGNATUR-TITEL
+# ============================================================
+
+def extract_signature_title(
+    data
+):
+
+    """
+    Sucht ausschließlich nach Feldern,
+    die explizit eine Destination-/Signatur-
+    Bezeichnung repräsentieren.
+
+    Allgemeine 'name'-Felder werden hier
+    NICHT verwendet.
+    """
+
+    possible_keys = [
+        "destinationSignatureTitle",
+        "destinationSignatureName",
+        "signatureTitle",
+        "signatureName",
+        "destinationName",
+        "destinationTitle",
+        "destinationSignature",
+    ]
+
+    for item in walk_json(data):
+
+        for key in possible_keys:
+
+            value = item.get(key)
+
+            if isinstance(value, str):
+
+                value = value.strip()
+
+                if value:
+                    return value
+
+            elif isinstance(value, dict):
+
+                for nested_key in [
+                    "title",
+                    "name",
+                    "bezeichnung",
+                    "value",
+                ]:
+
+                    nested = value.get(
+                        nested_key
+                    )
+
+                    if isinstance(
+                        nested,
+                        str
+                    ) and nested.strip():
+
+                        return nested.strip()
+
+    return ""
+
+
+# ============================================================
+# 4. OD-ORGANISATIONEN
+# ============================================================
+
+def get_od_organisations(
+    od_id
+):
+
+    url = OD_ORGANISATIONS_URL.format(
+        od_id=od_id
+    )
+
+    return get_json(
+        url
     )
 
 
-    url = (
-        "https://pvog.fitko.net/"
-        "suchdienst/api/v1/"
-        "relations/jzufi-2-3?"
-        f"ars={ars}&lbids={target}"
+# ============================================================
+# OD-DATEN
+# ============================================================
+
+def get_od_detail(
+    od_id
+):
+
+    return get_json(
+        OD_DETAIL_URL,
+        params={
+            "q": od_id
+        },
     )
 
 
-    resp = fetch_url(url)
+def extract_od_url(
+    data
+):
+
+    urls = []
+
+    for item in walk_json(data):
+
+        for key, value in item.items():
+
+            if not isinstance(
+                value,
+                str
+            ):
+                continue
+
+            value = value.strip()
+
+            if not value.startswith(
+                "http"
+            ):
+                continue
+
+            key_lower = key.lower()
+
+            # Datenschutz separat behandeln
+            if (
+                "datenschutz" not in key_lower
+                and "privacy" not in key_lower
+            ):
+
+                urls.append(value)
+
+    return unique(urls)
 
 
-    if resp and resp.status_code == 200:
+def extract_datenschutz_url(
+    data
+):
 
-        try:
+    urls = []
 
-            data = resp.json()
+    for item in walk_json(data):
 
-            values = []
+        for key, value in item.items():
+
+            if not isinstance(
+                value,
+                str
+            ):
+                continue
+
+            value = value.strip()
+
+            if not value.startswith(
+                "http"
+            ):
+                continue
+
+            key_lower = key.lower()
+
+            if (
+                "datenschutz" in key_lower
+                or "privacy" in key_lower
+            ):
+
+                urls.append(value)
+
+    return unique(urls)
 
 
-            def find_values(obj):
+# ============================================================
+# OE-ID-SIGNATUR BEI ROUTING 2.3
+# ============================================================
+
+def extract_routing_23_signature(
+    data
+):
+
+    """
+    PVOG/XZuFi 2.3:
+
+    Es werden idSekundaer-Werte aus dem
+    XZuFi-/JZuFi-Datensatz gesucht.
+
+    Es wird ausschließlich ein tatsächlich
+    vorhandener Wert ausgegeben.
+    """
+
+    values = []
+
+    for item in walk_json(data):
+
+        if "idSekundaer" not in item:
+            continue
+
+        value = item.get(
+            "idSekundaer"
+        )
+
+        if isinstance(
+            value,
+            list
+        ):
+
+            for entry in value:
 
                 if isinstance(
-                    obj,
+                    entry,
                     dict
                 ):
 
-                    for key,value in obj.items():
-
-                        if key == "idSekundaer":
-
-                            if isinstance(
-                                value,
-                                list
-                            ):
-
-                                for x in value:
-
-                                    if "value" in x:
-
-                                        values.append(
-                                            str(
-                                                x["value"]
-                                            )
-                                        )
-
-                        else:
-
-                            find_values(
-                                value
-                            )
-
-
-                elif isinstance(
-                    obj,
-                    list
-                ):
-
-                    for x in obj:
-
-                        find_values(
-                            x
-                        )
-
-
-            find_values(
-                data
-            )
-
-
-            if not values:
-
-                return (
-                    "nicht vorhanden"
-                )
-
-
-            if len(values[0]) < 500:
-
-                return (
-                    "evtl. zu kurz"
-                )
-
-
-            return (
-                "vorhanden"
-            )
-
-
-        except Exception:
-
-            pass
-
-
-    return (
-        "nicht vorhanden"
-    )
-
-# ============================================================
-# OD DETAILDATEN
-# ============================================================
-
-
-def check_od_id(
-        od_id
-):
-
-    if not od_id:
-
-        return (
-            "",
-            ""
-        )
-
-
-    url = (
-        "https://pvog.fitko.net/"
-        "suchdienst/api/v2/"
-        f"onlineservices/detail?q={od_id}"
-    )
-
-
-    resp = fetch_url(url)
-
-
-    uri = ""
-    datenschutz = ""
-
-
-    if resp and resp.status_code == 200:
-
-        try:
-
-            data = resp.json()
-
-
-            links = data.get(
-                "links",
-                []
-            )
-
-
-            uri = next(
-                (
-                    x.get("uri")
-                    for x in links
-                    if x.get("uri")
-                ),
-                ""
-            )
-
-
-            if (
-                "efa.datenschutzerklaerung.url"
-                in json.dumps(data)
-            ):
-
-                datenschutz = "vorhanden"
-
-
-        except Exception:
-
-            pass
-
-
-    return (
-        uri,
-        datenschutz
-    )
-
-
-
-# ============================================================
-# HAUPTANALYSE
-# ============================================================
-
-
-def run_analysis(
-        ars,
-        logger
-):
-
-
-    logger.write(
-        f"Starte Analyse für ARS {ars}"
-    )
-
-
-    status_verlust = check_dienst_url(
-        ars,
-        "Verlustmeldung",
-        logger
-    )
-
-
-    status_befreiung = check_dienst_url(
-        ars,
-        "Befreiung",
-        logger
-    )
-
-
-    logger.write(
-        f"Verlustmeldung: {status_verlust}"
-    )
-
-    logger.write(
-        f"Befreiung: {status_befreiung}"
-    )
-
-
-    raw_results = []
-
-    has_oe2 = False
-    has_od2 = False
-
-
-    services = [
-
-        (
-            "Verlustmeldung",
-            LEIKAS_VERLUST
-        ),
-
-        (
-            "Befreiung",
-            LEIKAS_BEFREIUNG
-        )
-
-    ]
-
-
-    for service_name, leikas in services:
-
-
-        for index, leika in enumerate(leikas):
-
-
-            oe_ids, od_ids, lbid = get_oe_od_ids(
-                ars,
-                leika,
-                logger
-            )
-
-
-            if len(oe_ids) > 1:
-
-                has_oe2 = True
-
-
-            if len(od_ids) > 1:
-
-                has_od2 = True
-
-
-
-            oe1 = (
-                oe_ids[0]
-                if len(oe_ids) > 0
-                else ""
-            )
-
-
-            oe2 = (
-                oe_ids[1]
-                if len(oe_ids) > 1
-                else ""
-            )
-
-
-            od1 = (
-                od_ids[0]
-                if len(od_ids) > 0
-                else ""
-            )
-
-
-            od2 = (
-                od_ids[1]
-                if len(od_ids) > 1
-                else ""
-            )
-
-
-
-            row = {
-
-
-                "dienst":
-                    service_name
-                    if index == 0
-                    else "",
-
-
-                "leika":
-                    leika,
-
-
-                "oe1":
-                [
-
-                    oe1,
-
-                    check_oe_id(
-                        oe1
-                    ),
-
-                    check_signatur(
-                        ars,
-                        leika
-                    )[1],
-
-                    check_signatur_oe(
-                        ars,
-                        leika,
-                        lbid
+                    candidate = entry.get(
+                        "value"
                     )
 
-                ],
+                    if candidate:
+                        values.append(
+                            str(candidate).strip()
+                        )
 
+                elif isinstance(
+                    entry,
+                    str
+                ):
 
+                    values.append(
+                        entry.strip()
+                    )
 
-                "oe2":
-                [
+        elif isinstance(
+            value,
+            dict
+        ):
 
-                    oe2,
-
-                    check_oe_id(
-                        oe2
-                    ),
-
-                    "",
-
-                    ""
-
-                ],
-
-
-
-                "od1":
-                [
-
-                    od1,
-
-                    check_od_id(
-                        od1
-                    )[1],
-
-                    check_od_id(
-                        od1
-                    )[0]
-
-                ],
-
-
-
-                "od2":
-                [
-
-                    od2,
-
-                    check_od_id(
-                        od2
-                    )[1],
-
-                    check_od_id(
-                        od2
-                    )[0]
-
-                ]
-
-            }
-
-
-            raw_results.append(
-                row
+            candidate = value.get(
+                "value"
             )
 
+            if candidate:
+                values.append(
+                    str(candidate).strip()
+                )
 
-    return (
-        raw_results,
-        status_verlust,
-        status_befreiung
-    )
+        elif isinstance(
+            value,
+            str
+        ):
 
+            values.append(
+                value.strip()
+            )
+
+    return unique(values)
 
 
 # ============================================================
-# EXCEL ERZEUGUNG IM SPEICHER
+# OE-DATEN EINER LEIKA
 # ============================================================
 
-
-def create_excel(
-        ars,
-        results,
-        status_v,
-        status_b
+def collect_oe_data(
+    ars,
+    lbid,
+    service_data,
+    od_ids,
 ):
 
+    oe_ids = find_oe_ids(
+        service_data
+    )
 
-    buffer = BytesIO()
+    # Zusätzlich OEs aus den konkreten
+    # OD-Zuständigkeitsrelationen laden.
+    for od_id in od_ids:
+
+        od_org_data = (
+            get_od_organisations(
+                od_id
+            )
+        )
+
+        if od_org_data:
+
+            oe_ids.extend(
+                find_oe_ids(
+                    od_org_data
+                )
+            )
+
+    oe_ids = unique(
+        oe_ids
+    )
+
+    titles = []
+    signature_titles = []
+    routing_signatures = []
+
+    for oe_id in oe_ids:
+
+        oe_detail = get_oe_detail(
+            oe_id,
+            lbid,
+            ars
+        )
+
+        if not oe_detail:
+            continue
+
+        # ----------------------------------------------------
+        # OE-ID Titel
+        # ----------------------------------------------------
+
+        title = extract_oe_title(
+            oe_detail
+        )
+
+        if title:
+            titles.append(title)
+
+        # ----------------------------------------------------
+        # OE-ID Signatur Titel
+        # ----------------------------------------------------
+
+        signature_title = (
+            extract_signature_title(
+                oe_detail
+            )
+        )
+
+        if signature_title:
+            signature_titles.append(
+                signature_title
+            )
+
+        # ----------------------------------------------------
+        # OE-ID Signatur bei Routing 2.3
+        # ----------------------------------------------------
+
+        routing_values = (
+            extract_routing_23_signature(
+                oe_detail
+            )
+        )
+
+        routing_signatures.extend(
+            routing_values
+        )
+
+    return {
+        "oe_ids": unique(oe_ids),
+        "oe_titles": unique(titles),
+        "signature_titles":
+            unique(signature_titles),
+        "routing_signatures":
+            unique(routing_signatures),
+    }
 
 
-    wb = openpyxl.Workbook()
+# ============================================================
+# OD-DATEN EINER LEIKA
+# ============================================================
 
-    ws = wb.active
+def collect_od_data(
+    od_ids
+):
 
-    ws.title = (
+    od_urls = []
+    privacy_urls = []
+
+    for od_id in od_ids:
+
+        data = get_od_detail(
+            od_id
+        )
+
+        if not data:
+            continue
+
+        od_urls.extend(
+            extract_od_url(
+                data
+            )
+        )
+
+        privacy_urls.extend(
+            extract_datenschutz_url(
+                data
+            )
+        )
+
+    return {
+        "od_ids":
+            unique(od_ids),
+
+        "privacy_urls":
+            unique(privacy_urls),
+
+        "od_urls":
+            unique(od_urls),
+    }
+
+
+# ============================================================
+# EINE LEIKA AUSWERTEN
+# ============================================================
+
+def analyse_leika(
+    ars,
+    leika
+):
+
+    # --------------------------------------------------------
+    # Schritt 1:
+    # Onlinedienste für ARS + LeiKa
+    # --------------------------------------------------------
+
+    online_data = (
+        get_online_services(
+            ars,
+            leika
+        )
+    )
+
+    if not online_data:
+
+        return {
+            "Leika-ID": leika,
+            "OE-ID": "",
+            "OE-ID Titel": "",
+            "OE-ID Signatur Titel": "",
+            "OE-ID Signatur bei Routing 2.3": "",
+            "OD-ID": "",
+            "OD-ID Datenschutz-URL": "",
+            "OD-ID URL": "",
+        }
+
+    # --------------------------------------------------------
+    # Schritt 2:
+    # OD-IDs
+    # --------------------------------------------------------
+
+    od_ids = find_od_ids(
+        online_data
+    )
+
+    # --------------------------------------------------------
+    # Schritt 3:
+    # LBID
+    # --------------------------------------------------------
+
+    lbid = find_lbid(
+        online_data,
+        leika
+    )
+
+    # --------------------------------------------------------
+    # Schritt 4:
+    # Leistungsdetail
+    # --------------------------------------------------------
+
+    service_detail = None
+
+    if lbid:
+
+        service_detail = (
+            get_service_detail(
+                lbid,
+                ars
+            )
+        )
+
+    # Falls v6 keinen Treffer liefert,
+    # verwenden wir zumindest die Daten
+    # der Onlinedienst-Abfrage.
+
+    source_for_oe = (
+        service_detail
+        if service_detail
+        else online_data
+    )
+
+    # --------------------------------------------------------
+    # Schritt 5:
+    # OE
+    # --------------------------------------------------------
+
+    oe_data = collect_oe_data(
+        ars,
+        lbid,
+        source_for_oe,
+        od_ids
+    )
+
+    # --------------------------------------------------------
+    # Schritt 6:
+    # OD
+    # --------------------------------------------------------
+
+    od_data = collect_od_data(
+        od_ids
+    )
+
+    return {
+        "Leika-ID":
+            leika,
+
+        "OE-ID":
+            "\n".join(
+                oe_data["oe_ids"]
+            ),
+
+        "OE-ID Titel":
+            "\n".join(
+                oe_data["oe_titles"]
+            ),
+
+        "OE-ID Signatur Titel":
+            "\n".join(
+                oe_data[
+                    "signature_titles"
+                ]
+            ),
+
+        "OE-ID Signatur bei Routing 2.3":
+            "\n".join(
+                oe_data[
+                    "routing_signatures"
+                ]
+            ),
+
+        "OD-ID":
+            "\n".join(
+                od_data["od_ids"]
+            ),
+
+        "OD-ID Datenschutz-URL":
+            "\n".join(
+                od_data[
+                    "privacy_urls"
+                ]
+            ),
+
+        "OD-ID URL":
+            "\n".join(
+                od_data[
+                    "od_urls"
+                ]
+            ),
+    }
+
+
+# ============================================================
+# EXCEL
+# ============================================================
+
+def create_excel(
+    results
+):
+
+    workbook = openpyxl.Workbook()
+
+    worksheet = workbook.active
+
+    worksheet.title = (
         "PVOG Resultate"
     )
 
-
-    ws.append(
-        [
-            "",
-            "ARS",
-            ars
-        ]
-    )
-
-
-    ws.append(
-        [
-            "",
-            f"Dienst URL Verlustmeldung: {status_v}"
-        ]
-    )
-
-
-    ws.append(
-        [
-            "",
-            f"Dienst URL Befreiung: {status_b}"
-        ]
-    )
-
-
-
     headers = [
-
-        "Dienst",
-        "Leika",
-
+        "Leika-ID",
         "OE-ID",
         "OE-ID Titel",
         "OE-ID Signatur Titel",
-        "OE-ID Signatur Routing 2.3",
-
-        "OE-ID2",
-        "OE-ID2 Titel",
-
+        "OE-ID Signatur bei Routing 2.3",
         "OD-ID",
-        "OD-ID Datenschutz",
+        "OD-ID Datenschutz-URL",
         "OD-ID URL",
-
-        "OD-ID2",
-        "OD-ID2 Datenschutz",
-        "OD-ID2 URL"
-
     ]
 
-
-    ws.append(
+    worksheet.append(
         headers
     )
 
-
-    for cell in ws[4]:
+    # Header formatieren
+    for cell in worksheet[1]:
 
         cell.font = Font(
             bold=True
         )
 
-
-
-    for item in results:
-
-
-        ws.append(
-
-            [
-
-                item["dienst"],
-
-                item["leika"],
-
-
-                *item["oe1"],
-
-
-                *item["oe2"],
-
-
-                *item["od1"],
-
-
-                *item["od2"]
-
-            ]
-
+        cell.alignment = Alignment(
+            vertical="top",
+            wrap_text=True
         )
 
+    # Daten
+    for result in results:
 
+        worksheet.append([
+            result.get(
+                "Leika-ID",
+                ""
+            ),
 
-    for column in ws.columns:
+            result.get(
+                "OE-ID",
+                ""
+            ),
 
-        max_length = 0
+            result.get(
+                "OE-ID Titel",
+                ""
+            ),
 
-        letter = (
-            column[0]
-            .column_letter
+            result.get(
+                "OE-ID Signatur Titel",
+                ""
+            ),
+
+            result.get(
+                "OE-ID Signatur bei Routing 2.3",
+                ""
+            ),
+
+            result.get(
+                "OD-ID",
+                ""
+            ),
+
+            result.get(
+                "OD-ID Datenschutz-URL",
+                ""
+            ),
+
+            result.get(
+                "OD-ID URL",
+                ""
+            ),
+        ])
+
+    # Zeilenumbruch
+    for row in worksheet.iter_rows():
+
+        for cell in row:
+
+            cell.alignment = Alignment(
+                vertical="top",
+                wrap_text=True
+            )
+
+    # Spaltenbreiten
+    for column in worksheet.columns:
+
+        maximum = 0
+
+        column_number = (
+            column[0].column
         )
-
 
         for cell in column:
 
-            if cell.value:
+            if cell.value is None:
+                continue
 
-                max_length = max(
-                    max_length,
-                    len(
-                        str(
-                            cell.value
-                        )
-                    )
-                )
+            # Mehrzeilige Zellen berücksichtigen
+            lines = str(
+                cell.value
+            ).split("\n")
 
+            length = max(
+                len(line)
+                for line in lines
+            )
 
-        ws.column_dimensions[
-            letter
-        ].width = min(
-            max_length + 2,
-            45
+            maximum = max(
+                maximum,
+                length
+            )
+
+        width = min(
+            max(
+                maximum + 2,
+                12
+            ),
+            55
         )
 
+        worksheet.column_dimensions[
+            get_column_letter(
+                column_number
+            )
+        ].width = width
 
-    wb.save(
-        buffer
+    worksheet.freeze_panes = "A2"
+
+    worksheet.auto_filter.ref = (
+        worksheet.dimensions
     )
 
+    output = BytesIO()
 
-    buffer.seek(
-        0
+    workbook.save(
+        output
     )
 
+    output.seek(0)
 
-    return buffer
-
+    return output
 
 
 # ============================================================
 # STREAMLIT BENUTZEROBERFLÄCHE
 # ============================================================
 
-
-st.title(
-    "🏛️ PVOG-Analysetool für AnnexPerso mit Excelausgabe"
-)
-
-
-
 ars = st.text_input(
-    "12-stelligen ARS eingeben: ",
-    max_chars=12
+    "ARS-Nummer",
+    max_chars=12,
+    placeholder="12-stellige ARS eingeben",
+)
+
+start = st.button(
+    "🔍 PVOG-Abfrage starten",
+    type="primary",
+    use_container_width=True,
 )
 
 
+if start:
 
-if st.button(
-    "🔍 Analyse starten"
-):
+    ars = ars.strip()
 
+    # --------------------------------------------------------
+    # Eingabeprüfung
+    # --------------------------------------------------------
+
+    if not ars:
+
+        st.error(
+            "Bitte eine ARS-Nummer eingeben."
+        )
+
+        st.stop()
+
+    if not ars.isdigit():
+
+        st.error(
+            "Die ARS darf nur Ziffern enthalten."
+        )
+
+        st.stop()
 
     if len(ars) != 12:
 
         st.error(
-            "Bitte eine gültige 12-stellige ARS eingeben."
+            "Bitte eine 12-stellige ARS eingeben."
         )
 
+        st.stop()
 
-    else:
+    # --------------------------------------------------------
+    # Fortschritt
+    # --------------------------------------------------------
 
+    progress = st.progress(0)
 
-        logger = StreamlitLogger()
+    status = st.empty()
 
+    results = []
 
-        with st.spinner(
-            "Analyse läuft..."
-        ):
+    total = len(
+        LEIKA_IDS
+    )
 
+    # --------------------------------------------------------
+    # Alle sieben LeiKa
+    # --------------------------------------------------------
 
-            results, status_v, status_b = run_analysis(
+    for index, leika in enumerate(
+        LEIKA_IDS
+    ):
+
+        status.info(
+            f"PVOG-Abfrage für LeiKa "
+            f"{leika} "
+            f"({index + 1}/{total})"
+        )
+
+        try:
+
+            result = analyse_leika(
                 ars,
-                logger
+                leika
             )
 
-
-            excel = create_excel(
-                ars,
-                results,
-                status_v,
-                status_b
+            results.append(
+                result
             )
 
+        except Exception as error:
 
-        st.success(
-            "Analyse abgeschlossen."
+            # Bei einem einzelnen Fehler
+            # bleibt die Zeile erhalten.
+
+            results.append({
+
+                "Leika-ID":
+                    leika,
+
+                "OE-ID": "",
+
+                "OE-ID Titel": "",
+
+                "OE-ID Signatur Titel":
+                    "",
+
+                "OE-ID Signatur bei Routing 2.3":
+                    "",
+
+                "OD-ID": "",
+
+                "OD-ID Datenschutz-URL":
+                    "",
+
+                "OD-ID URL": "",
+            })
+
+            st.warning(
+                f"Fehler bei {leika}: "
+                f"{error}"
+            )
+
+        progress.progress(
+            int(
+                ((index + 1) / total)
+                * 100
+            )
         )
 
+    # --------------------------------------------------------
+    # Excel
+    # --------------------------------------------------------
 
-        st.download_button(
+    status.success(
+        "PVOG-Abfrage abgeschlossen."
+    )
 
-            label=
-            "📥 Excel-Datei herunterladen",
+    excel_file = create_excel(
+        results
+    )
 
-            data=
-            excel,
+    st.subheader(
+        "Ergebnis"
+    )
 
-            file_name=
-            f"PVOG_Resultate_{ars}.xlsx",
+    # Vorschau
+    st.dataframe(
+        results,
+        use_container_width=True,
+        hide_index=True,
+    )
 
-            mime=
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-
-        )
+    # Download
+    st.download_button(
+        label="📥 Excel-Datei herunterladen",
+        data=excel_file,
+        file_name=(
+            f"PVOG_Resultate_{ars}.xlsx"
+        ),
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        use_container_width=True,
+    )
